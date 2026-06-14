@@ -473,6 +473,222 @@ def _get_path_for_avatar_texture(texture: Gdk.Texture) -> Path:
     return path
 
 
+class MacOSNotification(NotificationBackend):
+    """Native macOS notification backend using UNUserNotificationCenter.
+
+    GioNotification relies on D-Bus which does not exist on stock macOS,
+    causing notifications to silently fail. The previous backend shelled
+    out to ``osascript display notification``, which cannot show avatars,
+    cannot be withdrawn, and runs as a separate process. This backend uses
+    the native UserNotifications framework via pyobjc and keeps the
+    ``NotificationBackend`` interface (``_send`` / ``_withdraw``).
+
+    Each delivered notification is tagged with a stable identifier derived
+    from ``event.context_id`` (or, for events without one, from the same
+    detail list ``GioNotification`` uses). ``_withdraw`` removes it via
+    ``removeDeliveredNotifications(withIdentifiers:)``. Incoming-message
+    notifications carry the contact avatar as a ``UNNotificationAttachment``.
+
+    https://dev.gajim.org/gajim/gajim/-/issues/12624
+    """
+
+    def __init__(self) -> None:
+        NotificationBackend.__init__(self)
+
+        # The UserNotifications pyobjc wrapper is not bundled, so load the
+        # macOS framework directly via objc.loadBundle(). The framework ships
+        # with the OS; only the pyobjc bridge (objc/AppKit/Foundation) needs
+        # to be present, which it already is for the macOS delegate handling.
+        import objc
+        from Foundation import NSBundle
+
+        bundle_path = NSBundle.bundleWithIdentifier_(
+            "com.apple.UserNotifications"
+        ).bundlePath()
+        self._UN = {}
+        objc.loadBundle(
+            "UserNotifications",
+            self._UN,
+            bundle_path=bundle_path,
+        )
+
+        UNUserNotificationCenter = self._UN["UNUserNotificationCenter"]
+        UNAuthorizationOptions = self._UN["UNAuthorizationOptions"]
+
+        self._center = UNUserNotificationCenter.alloc().init()
+
+        # Request alert/sound/badge authorization. The completion handler is
+        # invoked asynchronously; we fire it and ignore the granted flag
+        # (notifications are simply dropped by the OS if not authorized).
+        options = (
+            UNAuthorizationOptions.Alert
+            | UNAuthorizationOptions.Sound
+            | UNAuthorizationOptions.Badge
+        )
+
+        def _auth_cb(_granted: bool, _error) -> None:
+            # Called on an arbitrary queue; nothing to do here.
+            pass
+
+        self._center.requestAuthorizationWithOptions_completionHandler_(
+            options, _auth_cb
+        )
+
+        # Install the delegate that brings Gajim to the front when the user
+        # activates a notification (the default action). See
+        # ``_make_delegate`` for the required protocol.
+        self._center.setDelegate_(self._make_delegate())
+
+    def _make_delegate(self):
+        """Build a ``UNUserNotificationCenterDelegate``.
+
+        The delegate implements the method the OS invokes when the user
+        interacts with a delivered notification. We only need the default
+        action (clicking the notification body) to bring Gajim's window to
+        the front. The required selector is::
+
+            userNotificationCenter:didReceiveNotificationResponse:
+                withCompletionHandler:
+
+        ``notificationResponse.actionIdentifier`` equals
+        ``UNNotificationDefaultActionIdentifier`` for the default tap. We
+        marshal the present() call back onto the GLib main loop because the
+        delegate runs on a system notification queue, not the GTK thread.
+        """
+        import objc
+
+        UNNotificationResponse = self._UN["UNNotificationResponse"]
+        UNNotificationDefaultActionIdentifier = self._UN[
+            "UNNotificationDefaultActionIdentifier"
+        ]
+
+        def _did_receive(
+            _center, response, completion_handler
+        ) -> None:
+            try:
+                if (
+                    response.actionIdentifier()
+                    == UNNotificationDefaultActionIdentifier
+                ):
+                    GLib.idle_add(app.window.present)
+            finally:
+                completion_handler()
+
+        Delegate = objc.lookUpClass("NSObject")
+        # objc.protocolNamed would let us formally adopt
+        # UNUserNotificationCenterDelegate, but informal conformance (just
+        # implementing the selector) is sufficient and avoids importing the
+        # Protocol wrapper, which is not bundled.
+        delegate = type(
+            "GajimNotificationDelegate",
+            (Delegate,),
+            {
+                "userNotificationCenter_didReceiveNotificationResponse_withCompletionHandler_": (
+                    _did_receive
+                )
+            },
+        ).alloc().init()
+        return delegate
+
+    def _send(self, event: events.Notification) -> None:
+        UNMutableNotificationContent = self._UN["UNMutableNotificationContent"]
+        UNNotificationRequest = self._UN["UNNotificationRequest"]
+
+        content = UNMutableNotificationContent.alloc().init()
+        content.setTitle_(event.title)
+        content.setBody_(_strip_html(event.text))
+
+        attachment = self._make_attachment(event)
+        if attachment is not None:
+            content.setAttachments_([attachment])
+
+        notification_id = self._make_notification_id(event)
+        if notification_id is None:
+            # Without a stable identifier we cannot withdraw; fall back to a
+            # one-shot UUID so the request is still accepted.
+            import uuid
+
+            notification_id = str(uuid.uuid4())
+
+        log.info("Sending macOS notification: %s", notification_id)
+        request = (
+            UNNotificationRequest.alloc().initWithIdentifier_content_trigger_(
+                notification_id, content, None
+            )
+        )
+        self._center.addNotificationRequest_withCompletionHandler_(
+            request, None
+        )
+
+    def _make_attachment(self, event: events.Notification):
+        """Return a UNNotificationAttachment for the avatar, or None.
+
+        Only incoming messages carry an avatar. The avatar ``Gdk.Texture`` is
+        written to a temp PNG first, because ``UNNotificationAttachment`` only
+        accepts a file URL.
+        """
+        if event.type != "incoming-message":
+            return None
+        if event.jid is None:
+            return None
+
+        UNNotificationAttachment = self._UN["UNNotificationAttachment"]
+        from Foundation import NSError
+        from Foundation import NSURL
+
+        try:
+            texture = _get_avatar_texture_for_notification(
+                event.account, event.jid, event.resource
+            )
+        except Exception:
+            log.debug("Failed to resolve avatar texture for notification")
+            return None
+
+        path = _get_path_for_avatar_texture(texture)
+        url = NSURL.fileURLWithPath_(str(path))
+        attachment, error = (
+            UNNotificationAttachment.attachmentWithIdentifier_URL_options_error_(
+                "avatar", url, None, None
+            )
+        )
+        if error is not None and not isinstance(error, type(None)):
+            log.debug("Failed to create notification attachment: %s", error)
+            return None
+        return attachment
+
+    def _make_notification_id(self, event: events.Notification) -> str | None:
+        if event.context_id:
+            return event.context_id
+
+        if event.type in ("connection-failed", "server-shutdown"):
+            return self._make_id([event.type, event.account])
+
+        if event.type == "incoming-message":
+            return self._make_id(["new-message", event.account, str(event.jid)])
+
+        return None
+
+    def _withdraw(self, details: list[Any]) -> None:
+        notification_id = self._make_id(details)
+
+        log.info("Withdraw macOS notification: %s", notification_id)
+        self._center.removeDeliveredNotificationsWithIdentifiers_(
+            [notification_id]
+        )
+
+    @staticmethod
+    def _make_id(details: list[Any]) -> str:
+        return ",".join(map(str, details))
+
+
+def _strip_html(text: str) -> str:
+    """Remove HTML markup for display in a plain-text notification body."""
+    import re
+
+    # Turn <img> and similar into nothing, drop the rest of the tags.
+    return re.sub(r"<[^>]+>", "", text)
+
+
 def get_notification_backend() -> NotificationBackend:
     if sys.platform == "win32":
         if int(platform.version().split(".")[2]) >= MIN_WINDOWS_TOASTS_WIN_VERSION:
@@ -483,6 +699,17 @@ def get_notification_backend() -> NotificationBackend:
                     "Error while trying to initialize notification backend: %s", e
                 )
         return DummyBackend()
+
+    if sys.platform == "darwin":
+        try:
+            return MacOSNotification()
+        except Exception as e:
+            log.error(
+                "Failed to init native macOS notification backend, "
+                "falling back to dummy: %s",
+                e,
+            )
+            return DummyBackend()
 
     return GioNotification()
 
