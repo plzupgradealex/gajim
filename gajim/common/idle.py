@@ -255,6 +255,145 @@ class Windows(IdleMonitor):
         return threshold > self._locked_time
 
 
+class Darwin(IdleMonitor):
+    """macOS idle monitor using CoreGraphics CGEventSourceSecondsSinceLastEventType.
+
+    Extended-away is reported while the screen is locked or the Mac sleeps.
+    The state is tracked via NSWorkspace notifications (system sleep / wake,
+    display sleep / wake) and distributed notifications (screenIsLocked /
+    screenIsUnlocked, posted by loginwindow).
+    """
+
+    def __init__(self) -> None:
+        IdleMonitor.__init__(self)
+
+        lib_path = ctypes.util.find_library("CoreGraphics")
+        if lib_path is None:
+            raise OSError("CoreGraphics could not be found.")
+
+        self._cg = ctypes.cdll.LoadLibrary(lib_path)
+        self._cg.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
+        self._cg.CGEventSourceSecondsSinceLastEventType.argtypes = [
+            ctypes.c_uint32,  # eventSourceStateID
+            ctypes.c_uint32,  # eventType
+        ]
+        log.debug("Idle monitor via CoreGraphics initialized")
+
+        # Extended-away is driven by notifications rather than the manual
+        # setter used by some platforms. Start unlocked/awake.
+        self._extended_away = False
+
+        # Notification registration is best-effort: if pyobjc is unavailable
+        # or observer setup fails, idle-time reporting still works (XA falls
+        # back to the idle-time threshold in IdleMonitorManager._poll).
+        self._observer = None
+        try:
+            self._register_notifications()
+        except Exception as error:
+            log.info("Darwin extended-away notifications unavailable: %s", error)
+
+    def _register_notifications(self) -> None:
+        # Imported lazily so the module stays importable on platforms without
+        # pyobjc; the Darwin monitor is only constructed on macOS.
+        import objc
+        from AppKit import NSWorkspace
+        from AppKit import NSWorkspaceDidWakeNotification
+        from AppKit import NSWorkspaceScreensDidSleepNotification
+        from AppKit import NSWorkspaceScreensDidWakeNotification
+        from AppKit import NSWorkspaceWillSleepNotification
+        from Foundation import NSDistributedNotificationCenter
+
+        # Build the NSObject observer subclass lazily. Defining it at module
+        # scope would require pyobjc to be importable at import time on every
+        # platform; building it here keeps non-darwin builds dependency-free.
+        DarwinIdleObserver = objc.lookUpClass("NSObject")
+
+        class _Observer(DarwinIdleObserver):  # type: ignore[misc, valid-type]
+            # Holds a strong reference to the monitor and flips its
+            # _extended_away flag from the main run loop.
+            def initWithMonitor_(self, monitor: Darwin) -> _Observer:
+                self = objc.super(_Observer, self).init()  # type: ignore[name-defined]
+                if self is None:
+                    return None
+                self._monitor = monitor
+                return self
+
+            def sleepOrWake_(self, notification) -> None:
+                # NSWorkspaceWillSleepNotification -> away;
+                # NSWorkspaceDidWakeNotification -> awake.
+                self._monitor._extended_away = (
+                    notification.name() == NSWorkspaceWillSleepNotification
+                )
+                log.info(
+                    "Darwin extended-away (sleep): %s",
+                    self._monitor._extended_away,
+                )
+
+            def screensSleepOrWake_(self, notification) -> None:
+                # Display sleep alone (lid closed / display off) is not a locked
+                # session; only clear the flag when the displays wake, to keep
+                # state consistent after the system wakes from sleep.
+                if notification.name() == NSWorkspaceScreensDidWakeNotification:
+                    self._monitor._extended_away = False
+                    log.info("Darwin extended-away (screens woke): cleared")
+
+            def screenLockChanged_(self, notification) -> None:
+                # 'com.apple.screenIsLocked' / 'com.apple.screenIsUnlocked' are
+                # distributed notifications posted by loginwindow.
+                self._monitor._extended_away = (
+                    notification.name() == "com.apple.screenIsLocked"
+                )
+                log.info(
+                    "Darwin extended-away (lock): %s",
+                    self._monitor._extended_away,
+                )
+
+        # Hold a strong reference so the observer is not garbage-collected.
+        self._observer = _Observer.alloc().initWithMonitor_(self)
+
+        ws_center = NSWorkspace.sharedWorkspace().notificationCenter()
+        ws_center.addObserver_selector_name_object_(
+            self._observer, "sleepOrWake:", NSWorkspaceWillSleepNotification, None
+        )
+        ws_center.addObserver_selector_name_object_(
+            self._observer, "sleepOrWake:", NSWorkspaceDidWakeNotification, None
+        )
+        ws_center.addObserver_selector_name_object_(
+            self._observer,
+            "screensSleepOrWake:",
+            NSWorkspaceScreensDidSleepNotification,
+            None,
+        )
+        ws_center.addObserver_selector_name_object_(
+            self._observer,
+            "screensSleepOrWake:",
+            NSWorkspaceScreensDidWakeNotification,
+            None,
+        )
+
+        dist_center = NSDistributedNotificationCenter.defaultCenter()
+        dist_center.addObserver_selector_name_object_(
+            self._observer, "screenLockChanged:", "com.apple.screenIsLocked", None
+        )
+        dist_center.addObserver_selector_name_object_(
+            self._observer, "screenLockChanged:", "com.apple.screenIsUnlocked", None
+        )
+
+    def get_idle_sec(self) -> int:
+        # kCGEventSourceStateHIDSystemState = 1
+        # kCGAnyInputEventType = ~0 (UINT32_MAX)
+        idle_time = self._cg.CGEventSourceSecondsSinceLastEventType(1, 0xFFFFFFFF)
+        return int(idle_time)
+
+    def set_extended_away(self, state: bool) -> None:
+        # Extended-away is driven by system notifications on macOS, not by the
+        # manual setter. Raise to match the Windows monitor's contract.
+        raise NotImplementedError
+
+    def is_extended_away(self) -> bool:
+        return self._extended_away
+
+
 class IdleMonitorManager(GObject.Object):
     __gsignals__ = {
         "state-changed": (
@@ -310,6 +449,13 @@ class IdleMonitorManager(GObject.Object):
     def _get_idle_monitor() -> IdleMonitor | None:
         if sys.platform == "win32":
             return Windows()
+
+        if sys.platform == "darwin":
+            try:
+                return Darwin()
+            except OSError as error:
+                log.info("Idle time via CoreGraphics not available: %s", error)
+            return None
 
         try:
             return DBusFreedesktop()
