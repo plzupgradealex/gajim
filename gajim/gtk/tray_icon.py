@@ -43,6 +43,14 @@ if sys.platform == "win32":
     import pystray
     from PIL import Image
 
+if sys.platform == "darwin":
+    from AppKit import NSImage
+    from AppKit import NSStatusBar
+    from AppKit import NSStatusItem
+    from AppKit import NSVariableStatusItemLength
+    from Foundation import NSData
+    import objc
+
 
 class TrayIcon:
     def __init__(self) -> None:
@@ -51,7 +59,10 @@ class TrayIcon:
         if sys.platform == "win32":
             self._backend = WindowsTrayIcon()
         elif sys.platform == "darwin":
-            self._backend = NoneBackend()
+            # macOS has no StatusNotifierItem/AppIndicator host (those are
+            # Linux-only DBus services), and Gtk.StatusIcon was removed in
+            # GTK4. Use a native NSStatusItem instead. #12239
+            self._backend = MacOSTrayIcon()
         else:
             self._backend = LinuxTrayIcon()
 
@@ -387,3 +398,216 @@ class LinuxTrayIcon(TrayIconBackend):
             return
         self._shutdown = True
         self._tray_icon.unregister()
+
+
+class MacOSTrayIcon(TrayIconBackend):
+    """Native macOS menu-bar item via NSStatusItem (pyobjc).
+
+    macOS has no StatusNotifierItem/AppIndicator host (those are Linux DBus
+    services), and Gtk.StatusIcon was removed in GTK4 — which is why the tray
+    icon that worked in Gajim 1.9.x (GTK3) vanished in the 2.x GTK4 port. This
+    backend provides the equivalent of the Windows/Linux backends using a real
+    NSStatusItem: a menu-bar icon that reflects presence/unread state, with a
+    Show/Hide/Status/Start Chat/Mute/Preferences/Quit menu.
+    See https://dev.gajim.org/gajim/gajim/-/issues/12239
+    """
+
+    def __init__(self) -> None:
+        TrayIconBackend.__init__(self)
+        # Keep strong references: pyobjc objects are garbage-collected if no
+        # Python reference is held, which would make the status item vanish.
+        self._status_item: NSStatusItem | None = None
+        self._menu: _GajimStatusMenuDelegate | None = None
+        self._enabled = False
+
+        self._status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+            NSVariableStatusItemLength
+        )
+        self._menu = _GajimStatusMenuDelegate.alloc().init(self)
+        self._status_item.setMenu_(self._menu.ns_menu)
+
+        if app.settings.get("show_trayicon"):
+            self.set_enabled(True)
+            self.update_state(init=True)
+
+    def update_state(self, init: bool = False) -> None:
+        if self._status_item is None:
+            return
+
+        if not init and app.window.get_total_unread_count():
+            icon_name = "message-new"
+        else:
+            icon_name = get_global_show()
+
+        image = self._get_icon(icon_name)
+        if image is not None and self._status_item is not None:
+            self._status_item.setImage_(image)
+            self._status_item.setToolTip_(self._get_tooltip(icon_name))
+
+        if self._menu is not None:
+            self._menu.refresh()
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = enabled
+        if self._status_item is None:
+            return
+        # NSStatusItem has no hide call; clear image/menu to hide and restore on
+        # enable. Recreating the system item on each toggle leaks status-bar
+        # slots, so mutate in place instead.
+        if enabled:
+            self.update_state(init=True)
+        else:
+            self._status_item.setImage_(None)
+            self._status_item.setMenu_(None)
+
+    def is_visible(self) -> bool:
+        return self._enabled
+
+    def shutdown(self) -> None:
+        # Remove the item from the menu bar on quit so we don't leak a slot.
+        if self._status_item is not None:
+            self._status_item.setImage_(None)
+            self._status_item.setMenu_(None)
+            NSStatusBar.systemStatusBar().removeStatusItem_(self._status_item)
+            self._status_item = None
+            self._menu = None
+
+    @staticmethod
+    def _get_tooltip(icon_name: str) -> str:
+        if icon_name == "message-new":
+            return _("Gajim – New Events")
+        return f"Gajim – {get_uf_show(icon_name)}"
+
+    @staticmethod
+    def _get_icon(icon_name: str) -> NSImage | None:
+        """Load a gajim-status-* PNG from the icon path as an NSImage.
+
+        Reuses the same status PNGs the Windows backend uses, drawn as a
+        menu-bar template image.
+        """
+        tray_icon_name = get_tray_icon_name(icon_name)
+        path = (
+            configpaths.get("ICONS")
+            / "hicolor"
+            / "32x32"
+            / "status"
+            / f"{tray_icon_name}.png"
+        )
+        if not path.is_file():
+            log.warning("macOS tray icon not found: %s", path)
+            return None
+        data = NSData.dataWithContentsOfFile_(str(path))
+        if data is None:
+            log.warning("Could not read macOS tray icon: %s", path)
+            return None
+        image = NSImage.alloc().initWithData_(data)
+        if image is None:
+            return None
+        # Template mode keeps the icon monochrome so it adapts to light/dark
+        # menu-bar appearance, matching the macOS tray-icon convention.
+        image.setTemplate_(True)
+        image.setSize_((18.0, 18.0))
+        return image
+
+
+class _GajimStatusMenuDelegate(objc.lookUpClass("NSObject")):
+    """Builds and owns the NSMenu shown when the menu-bar item is clicked.
+
+    AppKit menu callbacks run off the GLib main loop, so all actions are
+    marshalled back to the GTK thread via GLib.idle_add, exactly like the
+    Windows/pystray backend does.
+    """
+
+    def init(self, owner: MacOSTrayIcon) -> _GajimStatusMenuDelegate:
+        self = objc.super(_GajimStatusMenuDelegate, self).init()
+        if self is None:
+            return None
+        self._owner = owner
+        self._ns_menu_cls = objc.lookUpClass("NSMenu")
+        self._item_cls = objc.lookUpClass("NSMenuItem")
+        self.ns_menu = self._ns_menu_cls.alloc().init()
+        self._submenu: Any = None
+        self._build()
+        return self
+
+    def refresh(self) -> None:
+        # The whole menu is rebuilt on refresh() so checkmark state (Mute
+        # Sounds) and status reflect live settings. Rebuilding an NSMenu on
+        # each open is cheap and avoids juggling individual item references.
+        self.ns_menu.removeAllItems()
+        self._build()
+
+    def _build(self) -> None:
+        owner = self._owner
+
+        def add(label: str, action: Any, key: str = "") -> None:
+            item = self._item_cls.alloc().initWithTitle_action_keyEquivalent_(
+                label, "invoke:", key
+            )
+            item.setTarget_(self)
+            item._gajim_action = action  # type: ignore[attr-defined]
+            self.ns_menu.addItem_(item)
+
+        def add_separator() -> None:
+            self.ns_menu.addItem_(self._item_cls.separatorItem())
+
+        add(_("Show/Hide Window"), lambda: GLib.idle_add(owner._on_show_hide))
+
+        # Status submenu
+        status_menu = self._ns_menu_cls.alloc().init()
+        for show in ("online", "away", "xa", "dnd"):
+            sub_item = (
+                self._item_cls.alloc().initWithTitle_action_keyEquivalent_(
+                    get_uf_show(show), "invoke:", ""
+                )
+            )
+            sub_item.setTarget_(self)
+            sub_item._gajim_action = (  # type: ignore[attr-defined]
+                lambda s=show: GLib.idle_add(owner._on_status_changed, s)
+            )
+            status_menu.addItem_(sub_item)
+        status_menu.addItem_(self._item_cls.separatorItem())
+        offline_item = (
+            self._item_cls.alloc().initWithTitle_action_keyEquivalent_(
+                get_uf_show("offline"), "invoke:", ""
+            )
+        )
+        offline_item.setTarget_(self)
+        offline_item._gajim_action = (  # type: ignore[attr-defined]
+            lambda: GLib.idle_add(owner._on_status_changed, "offline")
+        )
+        status_menu.addItem_(offline_item)
+
+        status_parent = (
+            self._item_cls.alloc().initWithTitle_action_keyEquivalent_(
+                _("Status"), "", ""
+            )
+        )
+        status_parent.setSubmenu_(status_menu)
+        self.ns_menu.addItem_(status_parent)
+        self._submenu = status_menu  # keep alive
+
+        add(_("Start Chat…"), lambda: GLib.idle_add(owner._on_start_chat))
+
+        mute_item = self._item_cls.alloc().initWithTitle_action_keyEquivalent_(
+            _("Mute Sounds"), "invoke:", ""
+        )
+        mute_item.setTarget_(self)
+        mute_item._gajim_action = (  # type: ignore[attr-defined]
+            lambda: GLib.idle_add(owner._on_sounds_mute)
+        )
+        # Reflect current state with a checkmark
+        muted = not app.settings.get("sounds_on")
+        mute_item.setState_(1 if muted else 0)
+        self.ns_menu.addItem_(mute_item)
+
+        add(_("Preferences"), lambda: GLib.idle_add(owner._on_preferences))
+        add_separator()
+        add(_("Quit"), lambda: GLib.idle_add(owner._on_quit))
+
+    # Single action selector bound to every item; dispatches via the per-item
+    # _gajim_action closure stashed above.
+    def invoke_(self, _sender) -> None:
+        action = getattr(_sender, "_gajim_action", None)
+        if action is not None:
+            action()
