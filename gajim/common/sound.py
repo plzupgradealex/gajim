@@ -64,14 +64,21 @@ class PlatformWindows(PlaySound):
 
 
 class PlatformMacOS(PlaySound):
+    def __init__(self) -> None:
+        self._sound: NSSound | None = None
+
     def play(self, path: Path, loop: bool = False) -> None:
         assert NSSound is not None
-        sound = NSSound.alloc()
-        sound.initWithContentsOfFile_byReference_(str(path), True)
-        sound.play()
+        # Stop any currently playing sound before starting a new one
+        self.stop()
+        self._sound = NSSound.alloc()
+        self._sound.initWithContentsOfFile_byReference_(str(path), True)
+        self._sound.play()
 
     def stop(self) -> None:
-        pass
+        if self._sound is not None:
+            self._sound.stop()
+            self._sound = None
 
     def loop_in_progress(self) -> bool:
         return False
