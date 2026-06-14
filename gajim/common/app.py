@@ -278,7 +278,10 @@ def detect_dependencies() -> None:
             )
         if langs:
             _dependencies["SPELLING"] = True
-    except (ImportError, ValueError):
+    except Exception:
+        # A present libspelling typelib with a missing/broken underlying
+        # shared library raises a GLib.GError (not ImportError/ValueError),
+        # which would crash startup. Spell-checking is optional.
         pass
 
     # SENTRY SDK
