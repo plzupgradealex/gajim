@@ -511,11 +511,14 @@ class GajimApplication(Adw.Application, CoreApplication):
             ns_app.setDelegate_(delegate)
 
             manager = NSAppleEventManager.sharedAppleEventManager()
+            # eventClass/eventID are OSType (unsigned int); pyobjc rejects the
+            # 'GURL' FourCharCode passed as bytes, so encode it big-endian.
+            gurl = int.from_bytes(b"GURL", "big")
             manager.setEventHandler_andSelector_forEventClass_andEventID_(
                 delegate,
                 b"handleGetURLEvent:withReplyEvent:",
-                b"GURL",  # kAEGetURL class
-                b"GURL",  # kAEGetURL id
+                gurl,  # kAEGetURL event class
+                gurl,  # kAEGetURL event id
             )
             self._macos_delegate = delegate
         except Exception:

@@ -432,7 +432,10 @@ class MacOSTrayIcon(TrayIconBackend):
         self._status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
             NSVariableStatusItemLength
         )
-        self._menu = _GajimStatusMenuDelegate.alloc().init(self)
+        self._menu = _GajimStatusMenuDelegate.alloc().init()
+        if self._menu is not None:
+            self._menu._owner = self
+            self._menu._build()
         self._status_item.setMenu_(self._menu.ns_menu)
 
         if app.settings.get("show_trayicon"):
@@ -551,16 +554,22 @@ class _GajimStatusMenuDelegate(objc.lookUpClass("NSObject")):
     Windows/pystray backend does.
     """
 
-    def init(self, owner: MacOSTrayIcon) -> _GajimStatusMenuDelegate:
+    def init(self) -> _GajimStatusMenuDelegate:
+        # NSObject.init takes no arguments, so the owner cannot be passed
+        # through here; the caller attaches it after allocation, before
+        # _build() runs.
         self = objc.super(_GajimStatusMenuDelegate, self).init()  # noqa: PLW0642
         if self is None:
             return None
-        self._owner = owner
+        self._owner = None
         self._ns_menu_cls = objc.lookUpClass("NSMenu")
         self._item_cls = objc.lookUpClass("NSMenuItem")
         self.ns_menu = self._ns_menu_cls.alloc().init()
         self._submenu: Any = None
-        self._build()
+        # Maps each NSMenuItem to its Python callback. NSMenuItem is an
+        # Objective-C object and rejects arbitrary Python attributes, so the
+        # callback is kept in this dict and looked up in invoke_().
+        self._actions: dict[Any, Any] = {}
         return self
 
     def refresh(self) -> None:
@@ -572,13 +581,14 @@ class _GajimStatusMenuDelegate(objc.lookUpClass("NSObject")):
 
     def _build(self) -> None:
         owner = self._owner
+        self._actions.clear()  # drop callbacks for items removed on refresh
 
         def add(label: str, action: Any, key: str = "") -> None:
             item = self._item_cls.alloc().initWithTitle_action_keyEquivalent_(
                 label, "invoke:", key
             )
             item.setTarget_(self)
-            item._gajim_action = action  # type: ignore[attr-defined]
+            self._actions[item] = action
             self.ns_menu.addItem_(item)
 
         def add_separator() -> None:
@@ -593,7 +603,7 @@ class _GajimStatusMenuDelegate(objc.lookUpClass("NSObject")):
                 get_uf_show(show), "invoke:", ""
             )
             sub_item.setTarget_(self)
-            sub_item._gajim_action = (  # type: ignore[attr-defined]
+            self._actions[sub_item] = (
                 lambda s=show: GLib.idle_add(owner._on_status_changed, s)
             )
             status_menu.addItem_(sub_item)
@@ -602,7 +612,7 @@ class _GajimStatusMenuDelegate(objc.lookUpClass("NSObject")):
             get_uf_show("offline"), "invoke:", ""
         )
         offline_item.setTarget_(self)
-        offline_item._gajim_action = (  # type: ignore[attr-defined]
+        self._actions[offline_item] = (
             lambda: GLib.idle_add(owner._on_status_changed, "offline")
         )
         status_menu.addItem_(offline_item)
@@ -620,7 +630,7 @@ class _GajimStatusMenuDelegate(objc.lookUpClass("NSObject")):
             _("Mute Sounds"), "invoke:", ""
         )
         mute_item.setTarget_(self)
-        mute_item._gajim_action = (  # type: ignore[attr-defined]
+        self._actions[mute_item] = (
             lambda: GLib.idle_add(owner._on_sounds_mute)
         )
         # Reflect current state with a checkmark
@@ -633,8 +643,8 @@ class _GajimStatusMenuDelegate(objc.lookUpClass("NSObject")):
         add(_("Quit"), lambda: GLib.idle_add(owner._on_quit))
 
     # Single action selector bound to every item; dispatches via the per-item
-    # _gajim_action closure stashed above.
+    # callback stashed in self._actions.
     def invoke_(self, _sender) -> None:
-        action = getattr(_sender, "_gajim_action", None)
+        action = self._actions.get(_sender)
         if action is not None:
             action()

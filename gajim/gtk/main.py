@@ -1354,7 +1354,7 @@ class MainWindow(Adw.ApplicationWindow, EventHelper):
     def _save_macos_window_position(self) -> None:
         # Persist the NSWindow frame origin so it can be restored next launch.
         try:
-            from Foundation import NSApp
+            from AppKit import NSApp
 
             window = NSApp.mainWindow()
             if window is None:
@@ -1372,7 +1372,7 @@ class MainWindow(Adw.ApplicationWindow, EventHelper):
         # on-screen. Returns False so the idle callback runs once.
         try:
             from AppKit import NSScreen
-            from Foundation import NSApp
+            from AppKit import NSApp
             from Foundation import NSMakeRect
 
             window = NSApp.mainWindow()

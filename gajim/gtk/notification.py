@@ -493,7 +493,11 @@ class MacOSNotification(NotificationBackend):
     """
 
     def __init__(self) -> None:
-        NotificationBackend.__init__(self)
+        # NotificationBackend.__init__ connects the state-changed signal and
+        # event handlers to this instance; it is deferred to the END of this
+        # method. If it ran first, a failing pyobjc setup below would leave a
+        # half-initialized instance wired to client signals, crashing inside
+        # the connect flow (and aborting roster/MAM/avatar sync).
 
         # The UserNotifications pyobjc wrapper is not bundled, so load the
         # macOS framework directly via objc.loadBundle(). The framework ships
@@ -538,6 +542,9 @@ class MacOSNotification(NotificationBackend):
         # activates a notification (the default action). See
         # ``_make_delegate`` for the required protocol.
         self._center.setDelegate_(self._make_delegate())
+
+        # All pyobjc setup succeeded; now safe to wire signals and events.
+        NotificationBackend.__init__(self)
 
     def _make_delegate(self):
         """Build a ``UNUserNotificationCenterDelegate``.

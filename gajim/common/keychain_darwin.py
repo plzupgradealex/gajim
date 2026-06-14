@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 
 import keyring
+from keyring.compat import properties
 
 __all__ = ["install"]
 
@@ -63,7 +64,7 @@ class MacOSKeychain(keyring.backend.KeyringBackend):
 
     SERVICE = "gajim"
 
-    @classmethod
+    @properties.classproperty
     def priority(cls) -> int:
         # High priority so we are selected over the fail/plaintext backends.
         # keyring treats a raised exception here as "not viable".
@@ -158,7 +159,10 @@ class MacOSKeychain(keyring.backend.KeyringBackend):
             kSecAttrService: service,
             kSecAttrAccount: username,
         }
-        error, _result = SecItemDelete(query, None)
+        # SecItemDelete takes only the query and returns a bare OSStatus
+        # (unlike SecItemAdd/SecItemCopyMatching, which also take a result
+        # out-pointer and return a (status, result) tuple).
+        error = SecItemDelete(query)
         if error == errSecItemNotFound:
             return False
         if error:
