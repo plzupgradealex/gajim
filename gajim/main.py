@@ -128,6 +128,14 @@ def _set_env_vars() -> None:
     # Disable legacy ciphers in cryptography
     os.environ["CRYPTOGRAPHY_OPENSSL_NO_LEGACY"] = "1"
 
+    if sys.platform == "darwin":
+        # Prevent ObjC fork-safety crashes in multiprocessing children.
+        # https://github.com/gajim/gajim/issues/12625
+        os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+        # Suppress macOS Crash Reporter for child processes
+        os.environ.setdefault("CRASH_REPORTER_ACTIVE", "0")
+        return
+
     if sys.platform != "win32":
         return
 
@@ -171,6 +179,18 @@ def _run_app() -> None:
 
 def set_proc_title(title: str) -> None:
     sysname = platform.system()
+    if sysname == "Darwin":
+        # Set the process name visible to Activity Monitor / ps. The bundled
+        # .app already shows 'Gajim' via CFBundleName; this mainly affects
+        # running from source.
+        try:
+            from Foundation import NSProcessInfo
+
+            NSProcessInfo.processInfo().setProcessName_(title)
+        except Exception:
+            pass
+        return
+
     if sysname in ("Linux", "FreeBSD", "OpenBSD", "NetBSD"):
         libc = CDLL(find_library("c"))
 
@@ -189,6 +209,11 @@ def set_proc_title(title: str) -> None:
 
 def run() -> None:
     multiprocessing.freeze_support()
+    if sys.platform == "darwin":
+        # macOS Launch Services passes -psn_XXXXXX as argv when launching from
+        # Finder/Spotlight/Dock. GApplication treats unknown options as errors.
+        sys.argv = [a for a in sys.argv if not a.startswith("-psn_")]
+
     if sys.platform != "win32":
         if os.geteuid() == 0:
             sys.exit("You must not launch gajim as root, it is insecure.")
