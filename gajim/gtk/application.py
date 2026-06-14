@@ -97,6 +97,18 @@ class GajimApplication(Adw.Application, CoreApplication):
         # required to track screensaver state
         self.props.register_session = True
 
+        if sys.platform == "darwin":
+            # macOS terminate-handshake state (lifecycle #12683).
+            # _macos_terminate_replied guards replyToApplicationShouldTerminate_
+            # so it is delivered exactly once (normal path or watchdog).
+            # _macos_terminate_watchdog holds the GLib source id of the safety
+            # timer started in applicationShouldTerminate_.
+            self._macos_terminate_replied = False
+            self._macos_terminate_watchdog = 0
+            # Strong ref to the NSApplicationDelegate (and its kAEGetURL
+            # selector); without it the delegate is garbage-collected.
+            self._macos_delegate = None
+
         self.add_main_option(
             "version",
             ord("V"),
@@ -253,6 +265,17 @@ class GajimApplication(Adw.Application, CoreApplication):
         self.avatar_storage = AvatarStorage()
         self._shortcut_manager = ShortcutManager()
 
+        if sys.platform == "darwin":
+            # C4: rebind shortcuts to macOS Cmd conventions (GTK4 <Primary>=Ctrl)
+            self._apply_macos_accelerators()
+            # NSApplicationDelegate for graceful quit (#12683) and xmpp: URI
+            # forwarding (#12649). Installed before the menu so the quit/URL
+            # handlers are in place as early as possible.
+            self._init_macos_delegate()
+            # Native global menu bar (App menu + Help); deferred to idle so it
+            # runs after GTK's Quartz setup. GTK4 renders no macOS menu bar.
+            GLib.idle_add(self._install_macos_menubar)
+
         app.load_css_config()
 
         from gajim.gtk.main import MainWindow
@@ -305,6 +328,243 @@ class GajimApplication(Adw.Application, CoreApplication):
 
         GLib.timeout_add(100, self._auto_connect)
 
+    def _apply_macos_accelerators(self) -> None:
+        '''Rebind standard shortcuts to macOS conventions (darwin only).
+
+        In GTK4 <Primary> is an alias for <Control>, not Command as it was in
+        GTK3; Command is <Meta>. Gajim's bare-key accelerators expand to
+        <Primary>X and thus resolve to Ctrl on macOS. Rebind to <Meta>.
+        Ref: https://gaphor.org/2022/12/10/gtk4-macos-keybindings/
+        '''
+        manager = self._shortcut_manager
+
+        def _rebind(group, action, accels):
+            try:
+                shortcut = manager.get_group(group).get_for_action(action)
+            except (KeyError, ValueError):
+                return
+            shortcut.set_custom_accelerators(accels)
+
+        _rebind("app", "app.quit", ["<Meta>q"])
+        _rebind("app", "app.start-chat", ["<Meta>n"])
+        _rebind("app", "app.create-groupchat", ["<Meta>g"])
+        _rebind("app", "app.preferences", ["<Meta>comma"])
+        _rebind("app", "app.plugins", ["<Meta>e"])
+        _rebind("app", "app.xml-console", ["<Meta>x"])
+        _rebind("main-win", "win.close-chat", ["<Meta>w"])
+        _rebind("main-win", "win.focus-search", ["<Meta>k"])
+        _rebind("main-win", "win.search-history", ["<Meta>f"])
+        _rebind("main-win", "win.switch-next-chat", ["<Meta>bracketright"])
+        _rebind("main-win", "win.switch-prev-chat", ["<Meta>bracketleft"])
+
+    def _install_macos_menubar(self) -> None:
+        '''Install a native macOS global menu bar (darwin only).
+
+        GTK4/libadwaita renders no macOS menu bar, so Help (and the app menu)
+        are unreachable the traditional way. Build a native NSApp.mainMenu:
+        App menu (About / Preferences / Quit) + Help menu mirroring the
+        in-app "help-menu" in gajim/data/gui/main.ui.
+        '''
+        try:
+            from AppKit import NSApplication, NSMenu, NSMenuItem
+            from Foundation import NSObject
+        except Exception as error:
+            app.log("app").warning(
+                "pyobjc not available; skipping native menu bar: %s", error)
+            return
+
+        # Integer tag -> Gajim app action. Native items are tagged and a single
+        # dispatch_ selector routes clicks to the real actions Gajim already
+        # defines. The Help items mirror gajim/data/gui/main.ui "help-menu".
+        _action_by_tag = {
+            1: "about",
+            2: "preferences",
+            10: "content",
+            11: "faq",
+            12: "privacy-policy",
+            13: "join-support-chat",
+            14: "shortcuts",
+            15: "features",
+        }
+
+        class _MenuDelegate(NSObject):
+            def dispatch_(self, sender):
+                try:
+                    from gi.repository import Gio
+                    action = _action_by_tag.get(int(sender.tag()))
+                    if action is not None:
+                        Gio.Application.get_default().activate_action(action, None)
+                except Exception:  # noqa: BLE001
+                    app.log("app").exception("macOS menu dispatch failed")
+
+        try:
+            nsapp = NSApplication.sharedApplication()
+            # Keep a reference so the delegate (menu targets) isn't GC'd.
+            delegate = _MenuDelegate.alloc().init()
+            self._macos_menu_delegate = delegate
+
+            main_menu = NSMenu.alloc().init()
+
+            def _item(title, tag, key=""):
+                mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    title, "dispatch:", key)
+                mi.setTag_(tag)
+                mi.setTarget_(delegate)
+                return mi
+
+            # App menu (shown bold as the app name)
+            app_menu = NSMenu.alloc().init()
+            app_menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Gajim", None, "")
+            app_menu_item.setSubmenu_(app_menu)
+            main_menu.addItem_(app_menu_item)
+            app_menu.addItem_(_item("About Gajim", 1))
+            app_menu.addItem_(NSMenuItem.separatorItem())
+            app_menu.addItem_(_item("Preferences…", 2, ","))
+            app_menu.addItem_(NSMenuItem.separatorItem())
+            _quit = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Quit Gajim", "terminate:", "q")
+            _quit.setTarget_(nsapp)
+            app_menu.addItem_(_quit)
+
+            # Help menu (rightmost, macOS convention)
+            help_menu = NSMenu.alloc().init()
+            help_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Help", None, "")
+            help_item.setSubmenu_(help_menu)
+            main_menu.addItem_(help_item)
+            help_menu.addItem_(_item("Wiki (Online)", 10))
+            help_menu.addItem_(_item("FAQ (Online)", 11))
+            help_menu.addItem_(_item("Privacy Policy (Online)", 12))
+            help_menu.addItem_(NSMenuItem.separatorItem())
+            help_menu.addItem_(_item("Join Support Chat", 13))
+            help_menu.addItem_(_item("Keyboard Shortcuts", 14))
+            help_menu.addItem_(_item("Features", 15))
+
+            nsapp.setMainMenu_(main_menu)
+            nsapp.setHelpMenu_(help_menu)
+            nsapp.activateIgnoringOtherApps_(True)
+        except Exception:
+            app.log("app").exception("Failed to install native macOS menu bar")
+
+    def _init_macos_delegate(self) -> None:
+        """Set up an NSApplicationDelegate (graceful quit) and an
+        NSAppleEventManager handler for clicked URIs.
+
+        macOS delivers a clicked xmpp: URI as a kAEGetURL / 'GURL' Apple Event
+        to NSApplication, not as argv. GTK4/GApplication on macOS does not
+        bridge Apple Events into GApplication::open or the command-line
+        handler, so the URI would be dropped. We install a handler that
+        forwards it to the existing 'handle-uri' GAction, marshalled to the
+        main thread with GLib.idle_add (which also covers the cold-start case
+        where the event arrives before the GApplication is fully activated).
+        https://dev.gajim.org/gajim/gajim/-/issues/12649
+        """
+        try:
+            from AppKit import NSApplication
+            from Foundation import NSAppleEventManager
+            import objc
+
+            app_ref = self
+
+            class GajimAppDelegate(objc.lookUpClass("NSObject")):
+                """Handles applicationShouldTerminate: and kAEGetURL."""
+
+                def applicationShouldTerminate_(self, _sender) -> int:
+                    # Defer via GLib so GTK shutdown runs on the main loop.
+                    idle_add_once(app_ref.start_shutdown)
+                    # Arm a watchdog: if _shutdown_complete has not replied
+                    # within ~10 s (e.g. a hung network close), force the
+                    # terminate handshake so the app is not left hung and
+                    # SIGKILLed by the system.
+                    # https://dev.gajim.org/gajim/gajim/-/issues/12683
+                    app_ref._arm_macos_terminate_watchdog()
+                    # NSApplicationTerminateLater = 2
+                    return 2
+
+                def handleGetURLEvent_withReplyEvent_(
+                    self, event: object, _reply: object
+                ) -> None:
+                    try:
+                        url = event.paramDescriptorForKeyword_(
+                            b"----"  # keyDirectObject
+                        ).stringValue()
+                    except Exception:
+                        app.log("app").exception(
+                            "Failed to extract URL from kAEGetURL event")
+                        return
+                    if not url:
+                        return
+                    GLib.idle_add(app_ref._dispatch_macos_uri, url)
+
+            delegate = GajimAppDelegate.alloc().init()
+            ns_app = NSApplication.sharedApplication()
+            ns_app.setDelegate_(delegate)
+
+            manager = NSAppleEventManager.sharedAppleEventManager()
+            manager.setEventHandler_andSelector_forEventClass_andEventID_(
+                delegate,
+                b"handleGetURLEvent:withReplyEvent:",
+                b"GURL",  # kAEGetURL class
+                b"GURL",  # kAEGetURL id
+            )
+            self._macos_delegate = delegate
+        except Exception:
+            app.log("app").exception(
+                "Failed to install macOS delegate / URI handler")
+
+    def _dispatch_macos_uri(self, url: str) -> bool:
+        """Forward a URI received from macOS to the 'handle-uri' GAction.
+
+        Runs on the GLib main thread via idle_add. Returns False so the idle
+        source is removed after a single fire.
+        https://dev.gajim.org/gajim/gajim/-/issues/12649
+        """
+        try:
+            self.activate_action("handle-uri", GLib.Variant("as", [url]))
+        except Exception:
+            app.log("app").exception("Failed to dispatch macOS URI: %s", url)
+        return False
+
+    def _arm_macos_terminate_watchdog(self) -> None:
+        """Start the macOS terminate safety timer (darwin only).
+
+        Called from applicationShouldTerminate: after returning
+        NSApplicationTerminateLater. If _shutdown_complete has not run within
+        ~10 s, the watchdog completes the terminate handshake.
+        """
+        if self._macos_terminate_watchdog != 0:
+            GLib.source_remove(self._macos_terminate_watchdog)
+        self._macos_terminate_watchdog = GLib.timeout_add(
+            10_000, self._macos_watchdog_reply)
+
+    def _macos_reply_to_terminate(self) -> None:
+        """Reply to the macOS terminate handshake exactly once (darwin only).
+
+        Both the normal _shutdown_complete path and the watchdog funnel
+        through here.
+        """
+        if self._macos_terminate_replied:
+            return
+        self._macos_terminate_replied = True
+        try:
+            from AppKit import NSApplication
+            NSApplication.sharedApplication().\
+                replyToApplicationShouldTerminate_(True)
+        except Exception:
+            pass
+
+    def _macos_watchdog_reply(self) -> bool:
+        if self._macos_terminate_watchdog != 0:
+            GLib.source_remove(self._macos_terminate_watchdog)
+            self._macos_terminate_watchdog = 0
+        if not self._macos_terminate_replied:
+            app.log("app").warning(
+                "macOS shutdown watchdog triggered: shutdown stalled, "
+                "forcing terminate reply")
+            self._macos_reply_to_terminate()
+        return False
+
     def _on_window_added(
         self, _application: GajimApplication, window: Gtk.Window
     ) -> None:
@@ -318,6 +578,13 @@ class GajimApplication(Adw.Application, CoreApplication):
     def _shutdown_complete(self) -> None:
         CoreApplication._shutdown_complete(self)
         self.uninhibit(self._inhibit_cookie)
+        if sys.platform == "darwin":
+            # Complete the macOS terminate handshake (#12683): cancel the
+            # watchdog and deliver the exactly-once reply so macOS quits us.
+            if self._macos_terminate_watchdog != 0:
+                GLib.source_remove(self._macos_terminate_watchdog)
+                self._macos_terminate_watchdog = 0
+            self._macos_reply_to_terminate()
         self.quit()
 
     def _on_query_end(self, _application: GajimApplication) -> None:
