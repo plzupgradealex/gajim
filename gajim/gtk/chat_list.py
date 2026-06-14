@@ -9,6 +9,7 @@ from typing import cast
 from typing import Literal
 
 import logging
+import sys
 from collections.abc import Iterator
 from datetime import datetime
 
@@ -78,12 +79,16 @@ class ChatList(Gtk.ListBox, EventHelper, SignalManager):
         self._connect(hover_controller, "leave", self._on_cursor_leave)
         self.add_controller(hover_controller)
 
-        chat_drop_target = Gtk.DropTarget(
-            formats=Gdk.ContentFormats.new_for_gtype(ChatListRow),
-            actions=Gdk.DragAction.MOVE,
-        )
-        self._connect(chat_drop_target, "drop", self._on_chat_drop)
-        self.add_controller(chat_drop_target)
+        # Reordering chats by drag crashes on macOS (GTK Quartz bug, GTK MR
+        # !9841). Skip the reorder drop target on darwin until a fixed GTK is
+        # bundled; file drops below are unaffected. (#12648)
+        if sys.platform != "darwin":
+            chat_drop_target = Gtk.DropTarget(
+                formats=Gdk.ContentFormats.new_for_gtype(ChatListRow),
+                actions=Gdk.DragAction.MOVE,
+            )
+            self._connect(chat_drop_target, "drop", self._on_chat_drop)
+            self.add_controller(chat_drop_target)
 
         file_drop_target = Gtk.DropTarget(
             formats=Gdk.ContentFormats.new_for_gtype(PreviewWidget),

@@ -8,6 +8,7 @@ from typing import Any
 from typing import Literal
 
 import datetime as dt
+import sys
 
 from gi.repository import Gdk
 from gi.repository import Gio
@@ -115,11 +116,14 @@ class ChatListRow(Gtk.ListBoxRow, SignalManager):
         )
         self._on_mute_setting_changed()
 
-        drag_source = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
-        self._connect(drag_source, "prepare", self._on_prepare)
-        self._connect(drag_source, "drag-begin", self._on_drag_begin)
-        self._connect(drag_source, "drag-end", self._on_drag_end)
-        self.add_controller(drag_source)
+        # Drag-to-reorder crashes on macOS due to a GTK Quartz bug (GTK MR !9841).
+        # Disable chat reordering on darwin until a fixed GTK is bundled. (#12648)
+        if sys.platform != "darwin":
+            drag_source = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+            self._connect(drag_source, "prepare", self._on_prepare)
+            self._connect(drag_source, "drag-begin", self._on_drag_begin)
+            self._connect(drag_source, "drag-end", self._on_drag_end)
+            self.add_controller(drag_source)
 
         if self.type == "groupchat":
             self._ui.group_chat_indicator.set_visible(True)

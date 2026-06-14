@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import sys
+
 from gi.repository import Gdk
 from gi.repository import GObject
 from gi.repository import Gtk
@@ -48,6 +50,10 @@ class SideBarListBoxRow(Gtk.ListBoxRow, SignalManager):
         app.check_finalize(self)
 
     def enable_as_drag_source(self) -> None:
+        # Drag-to-reorder crashes on macOS due to a GTK Quartz bug (GTK MR !9841).
+        # Disable on darwin until a fixed GTK is bundled. (#12648)
+        if sys.platform == "darwin":
+            return
         drag_source = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
         self._connect(drag_source, "prepare", self._on_prepare)
         self._connect(drag_source, "drag-begin", self._on_drag_begin)

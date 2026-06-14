@@ -9,6 +9,7 @@ from typing import cast
 from typing import TYPE_CHECKING
 
 import logging
+import sys
 from collections.abc import Iterator
 
 from gi.repository import Gdk
@@ -43,13 +44,17 @@ class WorkspaceListBox(Gtk.ListBox):
     def __init__(self) -> None:
         Gtk.ListBox.__init__(self)
 
-        formats_workspace = Gdk.ContentFormats.new_for_gtype(SideBarListBoxRow)
-        formats_chat_list_row = Gdk.ContentFormats.new_for_gtype(ChatListRow)
-        formats = formats_workspace.union(formats_chat_list_row)
+        # Reordering workspaces/chats by drag crashes on macOS (GTK Quartz bug,
+        # GTK MR !9841). Skip the reorder drop target on darwin until a fixed
+        # GTK is bundled. (#12648)
+        if sys.platform != "darwin":
+            formats_workspace = Gdk.ContentFormats.new_for_gtype(SideBarListBoxRow)
+            formats_chat_list_row = Gdk.ContentFormats.new_for_gtype(ChatListRow)
+            formats = formats_workspace.union(formats_chat_list_row)
 
-        drop_target = Gtk.DropTarget(formats=formats, actions=Gdk.DragAction.MOVE)
-        drop_target.connect("drop", self._on_drop)
-        self.add_controller(drop_target)
+            drop_target = Gtk.DropTarget(formats=formats, actions=Gdk.DragAction.MOVE)
+            drop_target.connect("drop", self._on_drop)
+            self.add_controller(drop_target)
 
         self.set_sort_func(self._sort_func)
 
