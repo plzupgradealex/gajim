@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import cast
 
 import logging
+import sys
 
 import keyring
 
@@ -45,6 +46,22 @@ class Interface:
         backends = keyring.backend.get_all_keyring()
         for backend in backends:
             log.info("Found keyring backend: %s", backend)
+
+        if sys.platform == "darwin" and not app.settings.get(
+            "enable_keepassxc_integration"
+        ):
+            # The bundled keyring ships no usable macOS backend (its
+            # keyring.backends.macOS needs pyobjc-Security, which is not
+            # bundled). Install our native Keychain backend directly, unless
+            # the user opted into KeePassXC integration.
+            from gajim.common import keychain_darwin
+
+            installed = keychain_darwin.install()
+            if installed is not None:
+                self.backend = installed
+                self._is_keyring_available = True
+                log.info("Select %s backend", self.backend)
+                return
 
         if app.settings.get("enable_keepassxc_integration") and package_version(
             "keyring>=23.8.1"
