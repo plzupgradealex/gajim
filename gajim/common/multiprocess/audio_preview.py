@@ -16,13 +16,21 @@ try:
 except Exception:
     if TYPE_CHECKING:
         from gi.repository import Gst
+    Gst = None  # type: ignore[assignment]
 
-Gst.init(None)
+# Gst may be unavailable (e.g. GStreamer not installed). Initializing or
+# using it would raise NameError/AttributeError and crash any process that
+# imports this module, so guard both the init and the extractor.
+if Gst is not None:
+    Gst.init(None)
 
 
 def extract_audio_properties(
     input_path: Path,
 ) -> tuple[list[tuple[float, float]], float] | None:
+    if Gst is None:
+        # GStreamer is not installed: audio previews are unavailable.
+        return None
     playbin = Gst.ElementFactory.make("playbin")
     audio_sink = Gst.Bin.new("audiosink")
     audioconvert = Gst.ElementFactory.make("audioconvert")
