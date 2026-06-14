@@ -557,19 +557,13 @@ class MacOSNotification(NotificationBackend):
         """
         import objc
 
-        UNNotificationResponse = self._UN["UNNotificationResponse"]
         UNNotificationDefaultActionIdentifier = self._UN[
             "UNNotificationDefaultActionIdentifier"
         ]
 
-        def _did_receive(
-            _center, response, completion_handler
-        ) -> None:
+        def _did_receive(_center, response, completion_handler) -> None:
             try:
-                if (
-                    response.actionIdentifier()
-                    == UNNotificationDefaultActionIdentifier
-                ):
+                if response.actionIdentifier() == UNNotificationDefaultActionIdentifier:
                     GLib.idle_add(app.window.present)
             finally:
                 completion_handler()
@@ -579,15 +573,19 @@ class MacOSNotification(NotificationBackend):
         # UNUserNotificationCenterDelegate, but informal conformance (just
         # implementing the selector) is sufficient and avoids importing the
         # Protocol wrapper, which is not bundled.
-        delegate = type(
-            "GajimNotificationDelegate",
-            (Delegate,),
-            {
-                "userNotificationCenter_didReceiveNotificationResponse_withCompletionHandler_": (
-                    _did_receive
-                )
-            },
-        ).alloc().init()
+        delegate = (
+            type(
+                "GajimNotificationDelegate",
+                (Delegate,),
+                {
+                    "userNotificationCenter_didReceiveNotificationResponse_withCompletionHandler_": (
+                        _did_receive
+                    )
+                },
+            )
+            .alloc()
+            .init()
+        )
         return delegate
 
     def _send(self, event: events.Notification) -> None:
@@ -611,14 +609,10 @@ class MacOSNotification(NotificationBackend):
             notification_id = str(uuid.uuid4())
 
         log.info("Sending macOS notification: %s", notification_id)
-        request = (
-            UNNotificationRequest.alloc().initWithIdentifier_content_trigger_(
-                notification_id, content, None
-            )
+        request = UNNotificationRequest.alloc().initWithIdentifier_content_trigger_(
+            notification_id, content, None
         )
-        self._center.addNotificationRequest_withCompletionHandler_(
-            request, None
-        )
+        self._center.addNotificationRequest_withCompletionHandler_(request, None)
 
     def _make_attachment(self, event: events.Notification):
         """Return a UNNotificationAttachment for the avatar, or None.
@@ -633,7 +627,6 @@ class MacOSNotification(NotificationBackend):
             return None
 
         UNNotificationAttachment = self._UN["UNNotificationAttachment"]
-        from Foundation import NSError
         from Foundation import NSURL
 
         try:
@@ -651,7 +644,7 @@ class MacOSNotification(NotificationBackend):
                 "avatar", url, None, None
             )
         )
-        if error is not None and not isinstance(error, type(None)):
+        if error is not None and error is not None:
             log.debug("Failed to create notification attachment: %s", error)
             return None
         return attachment
@@ -672,9 +665,7 @@ class MacOSNotification(NotificationBackend):
         notification_id = self._make_id(details)
 
         log.info("Withdraw macOS notification: %s", notification_id)
-        self._center.removeDeliveredNotificationsWithIdentifiers_(
-            [notification_id]
-        )
+        self._center.removeDeliveredNotificationsWithIdentifiers_([notification_id])
 
     @staticmethod
     def _make_id(details: list[Any]) -> str:

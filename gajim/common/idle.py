@@ -312,7 +312,7 @@ class Darwin(IdleMonitor):
             # Holds a strong reference to the monitor and flips its
             # _extended_away flag from the main run loop.
             def initWithMonitor_(self, monitor: Darwin) -> _Observer:
-                self = objc.super(_Observer, self).init()  # type: ignore[name-defined]
+                self = objc.super(_Observer, self).init()  # type: ignore[name-defined]  # noqa: PLW0642
                 if self is None:
                     return None
                 self._monitor = monitor

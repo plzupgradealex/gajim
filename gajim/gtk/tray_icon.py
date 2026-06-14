@@ -44,12 +44,12 @@ if sys.platform == "win32":
     from PIL import Image
 
 if sys.platform == "darwin":
+    import objc
     from AppKit import NSImage
     from AppKit import NSStatusBar
     from AppKit import NSStatusItem
     from AppKit import NSVariableStatusItemLength
     from Foundation import NSData
-    import objc
 
 
 class TrayIcon:
@@ -519,7 +519,7 @@ class _GajimStatusMenuDelegate(objc.lookUpClass("NSObject")):
     """
 
     def init(self, owner: MacOSTrayIcon) -> _GajimStatusMenuDelegate:
-        self = objc.super(_GajimStatusMenuDelegate, self).init()
+        self = objc.super(_GajimStatusMenuDelegate, self).init()  # noqa: PLW0642
         if self is None:
             return None
         self._owner = owner
@@ -556,10 +556,8 @@ class _GajimStatusMenuDelegate(objc.lookUpClass("NSObject")):
         # Status submenu
         status_menu = self._ns_menu_cls.alloc().init()
         for show in ("online", "away", "xa", "dnd"):
-            sub_item = (
-                self._item_cls.alloc().initWithTitle_action_keyEquivalent_(
-                    get_uf_show(show), "invoke:", ""
-                )
+            sub_item = self._item_cls.alloc().initWithTitle_action_keyEquivalent_(
+                get_uf_show(show), "invoke:", ""
             )
             sub_item.setTarget_(self)
             sub_item._gajim_action = (  # type: ignore[attr-defined]
@@ -567,10 +565,8 @@ class _GajimStatusMenuDelegate(objc.lookUpClass("NSObject")):
             )
             status_menu.addItem_(sub_item)
         status_menu.addItem_(self._item_cls.separatorItem())
-        offline_item = (
-            self._item_cls.alloc().initWithTitle_action_keyEquivalent_(
-                get_uf_show("offline"), "invoke:", ""
-            )
+        offline_item = self._item_cls.alloc().initWithTitle_action_keyEquivalent_(
+            get_uf_show("offline"), "invoke:", ""
         )
         offline_item.setTarget_(self)
         offline_item._gajim_action = (  # type: ignore[attr-defined]
@@ -578,10 +574,8 @@ class _GajimStatusMenuDelegate(objc.lookUpClass("NSObject")):
         )
         status_menu.addItem_(offline_item)
 
-        status_parent = (
-            self._item_cls.alloc().initWithTitle_action_keyEquivalent_(
-                _("Status"), "", ""
-            )
+        status_parent = self._item_cls.alloc().initWithTitle_action_keyEquivalent_(
+            _("Status"), "", ""
         )
         status_parent.setSubmenu_(status_menu)
         self.ns_menu.addItem_(status_parent)
