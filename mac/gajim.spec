@@ -34,6 +34,14 @@ for lib_name in hidden_libs:
 
 # Collect GI-repository typelibs
 gi_typelib_files = glob.glob(lib_path + 'girepository-*/*.typelib')
+# Skip the GTK3 stack (Gtk-3.0/Gdk-3.0): Gajim is GTK4-only, and shipping
+# both makes the GObject type system register GtkWidget twice, corrupting
+# GTK and tearing the window down mid-run.
+gi_typelib_files = [
+    f for f in gi_typelib_files
+    if not os.path.basename(f).endswith(
+        ('Gtk-3.0.typelib', 'Gdk-3.0.typelib', 'GdkX11-3.0.typelib'))
+]
 for lib_file in gi_typelib_files:
 	hidden_binaries.append((lib_file, 'gi_typelibs/'))
 
@@ -57,6 +65,20 @@ a = Analysis(['launch.py'],
              win_private_assemblies=False,
              cipher=block_cipher,
              noarchive=False)
+# Even with the GTK3 typelibs excluded above, PyInstaller's gi hook can still
+# drag libgtk-3/libgdk-3 in via another typelib's recorded dependency.
+# Nothing in the bundle links them except each other, and Gajim imports
+# Gtk-4.0 only, so drop every GTK3 survivor: shipping GTK3 and GTK4 together
+# corrupts the GObject type system.
+_gtk3_dylibs = ('libgtk-3', 'libgdk-3')
+_gtk3_typelibs = ('Gtk-3.0.typelib', 'Gdk-3.0.typelib', 'GdkX11-3.0.typelib')
+a.binaries = [
+    b for b in a.binaries
+    if not os.path.basename(b[0]).startswith(_gtk3_dylibs)
+    and os.path.basename(b[0]) not in _gtk3_typelibs
+]
+a.datas = [d for d in a.datas if os.path.basename(d[0]) not in _gtk3_typelibs]
+
 pyz = PYZ(a.pure, a.zipped_data,
              cipher=block_cipher)
 exe = EXE(pyz,
