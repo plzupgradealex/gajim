@@ -102,6 +102,8 @@ IntSettings = Literal[
     "groupchat_roster_width",
     "mainwin_height",
     "mainwin_width",
+    "mainwin_x",
+    "mainwin_y",
     "preview_max_file_size",
     "preview_size",
 ]
@@ -200,6 +202,9 @@ APP_SETTINGS: dict[str, str | int | float | bool | list[Any]] = {
     "latest_disco_addresses": "",
     "mainwin_height": 500,
     "mainwin_width": 1000,
+    # -1 means "never saved": the window is placed by the OS on first run.
+    "mainwin_x": -1,
+    "mainwin_y": -1,
     "action_on_close": "hide",
     "muc_highlight_words": "",
     "muc_prefer_direct_msg": True,

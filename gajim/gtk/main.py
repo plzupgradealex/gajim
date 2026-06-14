@@ -251,6 +251,13 @@ class MainWindow(Adw.ApplicationWindow, EventHelper):
 
         self.set_visible(True)
 
+        if sys.platform == "darwin":
+            # GTK4 removed app-controlled window positioning, but on macOS the
+            # exact frame can be restored via the backing NSWindow. The
+            # GdkMacos surface does not expose get_nswindow() to Python, so we
+            # reach it through NSApp.mainWindow() once the window is realized.
+            GLib.idle_add(self._restore_macos_window_position)
+
         if app.is_display(Display.X11):
             self.set_skip_taskbar_hint(not app.settings.get("show_in_taskbar"))
 
@@ -1344,6 +1351,52 @@ class MainWindow(Adw.ApplicationWindow, EventHelper):
         if not self.chat_exists(event.account, event.jid):
             self.add_chat(event.account, event.jid, "chat")
 
+    def _save_macos_window_position(self) -> None:
+        # Persist the NSWindow frame origin so it can be restored next launch.
+        try:
+            from Foundation import NSApp
+
+            window = NSApp.mainWindow()
+            if window is None:
+                return
+            frame = window.frame()
+            app.settings.set("mainwin_x", int(frame.origin.x))
+            app.settings.set("mainwin_y", int(frame.origin.y))
+        except Exception:
+            log.exception("Failed to save macOS window position")
+
+    def _restore_macos_window_position(self) -> bool:
+        # GTK4 has no app-level window positioning; on macOS set the backing
+        # NSWindow frame directly. The origin is clamped to the visible screen
+        # frame so a window saved on a now-disconnected display still appears
+        # on-screen. Returns False so the idle callback runs once.
+        try:
+            from AppKit import NSScreen
+            from Foundation import NSApp
+            from Foundation import NSMakeRect
+
+            window = NSApp.mainWindow()
+            if window is None:
+                return False
+            saved_x = app.settings.get("mainwin_x")
+            saved_y = app.settings.get("mainwin_y")
+            if saved_x < 0 or saved_y < 0:
+                return False
+            screen = NSScreen.mainScreen()
+            if screen is None:
+                return False
+            visible = screen.visibleFrame()
+            width = app.settings.get("mainwin_width")
+            height = app.settings.get("mainwin_height")
+            max_x = visible.origin.x + visible.size.width - width
+            max_y = visible.origin.y + visible.size.height - height
+            x = min(max(saved_x, visible.origin.x), max_x)
+            y = min(max(saved_y, visible.origin.y), max_y)
+            window.setFrame_display_(NSMakeRect(x, y, width, height), True)
+        except Exception:
+            log.exception("Failed to restore macOS window position")
+        return False
+
     def start_shutdown(self) -> None:
         self.show_toast(Adw.Toast(title=_("Gajim is quitting…"), timeout=0))
         app.ged.raise_event(events.PrepareForShutdown())
@@ -1352,6 +1405,9 @@ class MainWindow(Adw.ApplicationWindow, EventHelper):
             window_width, window_height = self.get_width(), self.get_height()
             app.settings.set("mainwin_width", window_width)
             app.settings.set("mainwin_height", window_height)
+
+            if sys.platform == "darwin":
+                self._save_macos_window_position()
 
     def reload_view(self, *args: Any) -> None:
         self.get_control().get_conversation_view().reload()
