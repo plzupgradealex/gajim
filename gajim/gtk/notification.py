@@ -517,25 +517,21 @@ class MacOSNotification(NotificationBackend):
         )
 
         UNUserNotificationCenter = self._UN["UNUserNotificationCenter"]
-        UNAuthorizationOptions = self._UN["UNAuthorizationOptions"]
 
-        self._center = UNUserNotificationCenter.alloc().init()
+        # Use the shared +currentNotificationCenter singleton; on modern macOS
+        # alloc().init() is rejected with "use +currentNotificationCenter".
+        self._center = UNUserNotificationCenter.currentNotificationCenter()
 
-        # Request alert/sound/badge authorization. The completion handler is
-        # invoked asynchronously; we fire it and ignore the granted flag
-        # (notifications are simply dropped by the OS if not authorized).
-        options = (
-            UNAuthorizationOptions.Alert
-            | UNAuthorizationOptions.Sound
-            | UNAuthorizationOptions.Badge
-        )
-
-        def _auth_cb(_granted: bool, _error) -> None:
-            # Called on an arbitrary queue; nothing to do here.
-            pass
-
+        # Request alert/sound/badge authorization. Two pyobjc gaps with
+        # objc.loadBundle() force raw values instead of the natural API:
+        #  - UNAuthorizationOptions is an NS_OPTIONS bitfield that loadBundle
+        #    does not expose (it loads ObjC classes, not enums), so pass the
+        #    bitmask as an int: Badge=1, Sound=2, Alert=4.
+        #  - The completion handler is a block, and loadBundle provides no
+        #    metadata to infer its signature, so pass None. The granted flag
+        #    is unused anyway (the OS silently drops notifications if denied).
         self._center.requestAuthorizationWithOptions_completionHandler_(
-            options, _auth_cb
+            1 | 2 | 4, None
         )
 
         # Install the delegate that brings Gajim to the front when the user
@@ -564,11 +560,14 @@ class MacOSNotification(NotificationBackend):
         """
         import objc
 
-        UNNotificationDefaultActionIdentifier = self._UN[
-            "UNNotificationDefaultActionIdentifier"
-        ]
+        # UNNotificationDefaultActionIdentifier is an NSString constant that
+        # objc.loadBundle() does not expose (it loads ObjC classes, not string
+        # constants), so use its fixed framework value directly.
+        UNNotificationDefaultActionIdentifier = (
+            "com.apple.UNNotificationDefaultActionIdentifier"
+        )
 
-        def _did_receive(_center, response, completion_handler) -> None:
+        def _did_receive(self, _center, response, completion_handler) -> None:
             try:
                 if response.actionIdentifier() == UNNotificationDefaultActionIdentifier:
                     GLib.idle_add(app.window.present)
