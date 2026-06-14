@@ -45,6 +45,7 @@ if sys.platform == "win32":
 
 if sys.platform == "darwin":
     import objc
+    from AppKit import NSApp
     from AppKit import NSImage
     from AppKit import NSStatusBar
     from AppKit import NSStatusItem
@@ -419,6 +420,14 @@ class MacOSTrayIcon(TrayIconBackend):
         self._status_item: NSStatusItem | None = None
         self._menu: _GajimStatusMenuDelegate | None = None
         self._enabled = False
+        # Dock tile used for the unread-count badge (separate from the
+        # menu-bar status item above).
+        self._dock_tile: Any | None = None
+
+        try:
+            self._dock_tile = NSApp.dockTile()
+        except Exception as error:
+            log.debug("dockTile unavailable: %s", error)
 
         self._status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
             NSVariableStatusItemLength
@@ -431,6 +440,8 @@ class MacOSTrayIcon(TrayIconBackend):
             self.update_state(init=True)
 
     def update_state(self, init: bool = False) -> None:
+        self._update_dock_badge()
+
         if self._status_item is None:
             return
 
@@ -446,6 +457,21 @@ class MacOSTrayIcon(TrayIconBackend):
 
         if self._menu is not None:
             self._menu.refresh()
+
+    def _update_dock_badge(self) -> None:
+        # Mirror the unread count onto the Dock tile badge. The Dock icon is
+        # only present when the app runs as a regular (non-accessory) app.
+        if self._dock_tile is None:
+            return
+        try:
+            count = app.window.get_total_unread_count()
+        except Exception:
+            count = 0
+        label = "" if count <= 0 else str(count)
+        try:
+            self._dock_tile.setBadgeLabel_(label)
+        except Exception as error:
+            log.debug("dockTile badge update failed: %s", error)
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
@@ -470,6 +496,13 @@ class MacOSTrayIcon(TrayIconBackend):
             self._status_item.setMenu_(None)
             NSStatusBar.systemStatusBar().removeStatusItem_(self._status_item)
             self._status_item = None
+
+        if self._dock_tile is not None:
+            try:
+                self._dock_tile.setBadgeLabel_("")
+            except Exception:
+                pass
+            self._dock_tile = None
             self._menu = None
 
     @staticmethod
