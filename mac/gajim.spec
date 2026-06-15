@@ -18,7 +18,7 @@ import glob
 import platform
 
 # Hidden libs to add because we remove PIL._imagingft to avoid non-system versions
-hidden_libs = ['libsoup-*.dylib', 'libgtksourceview-*.dylib', 'libspelling-*.dylib']
+hidden_libs = ['libsoup-*.dylib', 'libgtksourceview-*.dylib']
 
 # Get homebrew lib path according to system arch
 if platform.machine() == 'x86_64':
@@ -44,20 +44,15 @@ gi_typelib_files = [
     if not os.path.basename(f).endswith(
         ('Gtk-3.0.typelib', 'Gdk-3.0.typelib', 'GdkX11-3.0.typelib'))
 ]
+# Drop Spelling-1 too: Homebrew's libspelling is built against the system
+# glib, so loading it inside this self-contained bundle (which ships its own
+# glib) deadlocks in spelling_checker_get_type during GType init. Gajim
+# tolerates a missing Spelling namespace — spellcheck is simply unavailable.
+gi_typelib_files = [
+    f for f in gi_typelib_files if os.path.basename(f) != 'Spelling-1.typelib'
+]
 for lib_file in gi_typelib_files:
 	hidden_binaries.append((lib_file, 'gi_typelibs/'))
-
-# A Homebrew lib ships as a versioned file plus an API-level symlink that
-# both resolve to one file under Cellar (e.g. libspelling-1.2.dylib and
-# libspelling-1.dylib). PyInstaller flattens symlinks, so collecting both
-# ships two identical copies, and each registers its GObject types on load
-# corrupting the type system ("cannot register existing type 'SpellingChecker'").
-# Collapse to one entry per real file.
-_seen = set()
-hidden_binaries = [
-	b for b in hidden_binaries
-	if os.path.realpath(b[0]) not in _seen and not _seen.add(os.path.realpath(b[0]))
-]
 
 sys.path.insert(0, os.path.join(cwd))
 
