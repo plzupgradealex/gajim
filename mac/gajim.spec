@@ -18,7 +18,7 @@ import glob
 import platform
 
 # Hidden libs to add because we remove PIL._imagingft to avoid non-system versions
-hidden_libs = ['libsoup-*.dylib', 'libgtksourceview-*.dylib']
+hidden_libs = ['libsoup-*.dylib', 'libgtksourceview-*.dylib', 'libspelling-*.dylib']
 
 # Get homebrew lib path according to system arch
 if platform.machine() == 'x86_64':
@@ -26,11 +26,13 @@ if platform.machine() == 'x86_64':
 elif platform.machine() == 'arm64':
 	lib_path = '/opt/homebrew/lib/'
 
-# Select the last libs found
+# Collect every match for each pattern — a typelib can reference a specific
+# soname (e.g. libspelling-1.2.dylib), so ship all variants rather than only
+# the last glob match (which used to drop the soname the typelib asks for).
 hidden_binaries = []
 for lib_name in hidden_libs:
-	lib_file = glob.glob(lib_path + lib_name)[-1]
-	hidden_binaries.append((lib_file, '.'))
+	for lib_file in glob.glob(lib_path + lib_name):
+		hidden_binaries.append((lib_file, '.'))
 
 # Collect GI-repository typelibs
 gi_typelib_files = glob.glob(lib_path + 'girepository-*/*.typelib')
